@@ -92,7 +92,7 @@ export default function FileViewer({ content }) {
         dangerouslySetInnerHTML={{ __html: html }}
       />
       <style>{`
-        mark.hit { background: #fff3a3; color: inherit; padding: 0 1px; }
+        mark.hit { background: #fff3a3; color: inherit: #1c1c1c; padding: 0 1px; }
         mark.hit.current { background: #ffd24d; outline: 1px solid #caa300; }
       `}</style>
     </div>
