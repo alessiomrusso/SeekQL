@@ -1,5 +1,6 @@
 # app/backend/indexer.py
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -8,31 +9,50 @@ from opensearchpy import OpenSearch, helpers
 from opensearchpy.helpers import BulkIndexError
 
 # ----------------------------
-# Environment / configuration
+# Environment / defaults
 # ----------------------------
-OS_HOST = os.getenv("OS_HOST", "localhost")
+OS_HOST = os.getenv("OS_HOST", "127.0.0.1")
 OS_PORT = int(os.getenv("OS_PORT", "9200"))
 INDEX_NAME = os.getenv("OS_INDEX", "sql_files")
 
 BULK_CHUNK_SIZE = int(os.getenv("BULK_CHUNK_SIZE", "500"))
 REQUEST_TIMEOUT = int(os.getenv("OS_REQUEST_TIMEOUT", "120"))
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))  # skip files larger than this
 
-CONFIG_FILE = Path(__file__).with_name("config.yml")
+# ----------------------------
+# Config loading (root-level seekql.config.yml)
+# ----------------------------
 
-# Load YAML config (optional)
+def _project_root() -> Path:
+    """
+    When frozen (PyInstaller onefile), use the folder where the EXE lives.
+    When running from source, project root is two levels up from this file (…/app/backend -> root).
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+# Determine config file path:
+CFG_PATH = os.getenv("SEEKQL_CONFIG")
+if CFG_PATH:
+    CONFIG_FILE = Path(CFG_PATH).expanduser()
+else:
+    CONFIG_FILE = _project_root() / "seekql.config.yml"
+
+_cfg = {}
 if CONFIG_FILE.exists():
     with CONFIG_FILE.open("r", encoding="utf-8") as f:
         _cfg = yaml.safe_load(f) or {}
-else:
-    _cfg = {}
 
-SQL_SOURCE_PATHS: List[Path] = [Path(p).expanduser() for p in _cfg.get("sql_source_paths", [])]
+# Pull values with sane fallbacks
+SQL_SOURCE_PATHS: List[Path] = [
+    Path(p).expanduser() for p in _cfg.get("sql_source_paths", [])
+]
 INCLUDE_EXTENSIONS: Tuple[str, ...] = tuple(
-    (ext if ext.startswith(".") else f".{ext}").lower()
+    (ext if str(ext).startswith(".") else f".{ext}").lower()
     for ext in _cfg.get("include_extensions", [".sql"])
 )
-EXCLUDE_DIRS: set = set(d.lower() for d in _cfg.get("exclude_dirs", []))
+EXCLUDE_DIRS = set(d.lower() for d in _cfg.get("exclude_dirs", []))
+MAX_FILE_SIZE_MB = int(_cfg.get("max_file_size_mb", os.getenv("MAX_FILE_SIZE_MB", 10)))
 
 # ----------------------------
 # OpenSearch client
@@ -48,47 +68,43 @@ client = OpenSearch(
 # ----------------------------
 def ensure_index() -> None:
     """
-    Ensure the target index exists with a mapping that includes a case-sensitive subfield:
-      - content       : text (standard analyzer, case-insensitive)
-      - content.cs    : text (custom analyzer without lowercase) for quoted searches
+    Ensure the index exists with a mapping that supports:
+      - content (standard analyzer, case-insensitive)
+      - content.cs (custom analyzer without lowercase) for case-sensitive phrases
     """
     if client.indices.exists(index=INDEX_NAME):
         return
-    client.indices.create(
-        index=INDEX_NAME,
-        body={
-            "settings": {
-                "analysis": {
-                    "analyzer": {
-                        "cs_analyzer": {  # case-preserving analyzer for "content.cs"
-                            "type": "custom",
-                            "tokenizer": "standard",
-                            "filter": []  # no lowercase filter => case-sensitive
-                        }
-                    }
-                }
-            },
-            "mappings": {
-                "properties": {
-                    "path": {"type": "keyword"},
-                    "filename": {"type": "keyword"},
-                    "content": {
-                        "type": "text",
-                        "fields": {
-                            "cs": {
-                                "type": "text",
-                                "analyzer": "cs_analyzer"
-                            }
-                        }
+
+    body = {
+        "settings": {
+            "analysis": {
+                "analyzer": {
+                    "cs_analyzer": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": []  # no lowercase -> case-sensitive
                     }
                 }
             }
+        },
+        "mappings": {
+            "properties": {
+                "path": {"type": "keyword"},
+                "filename": {"type": "keyword"},
+                "content": {
+                    "type": "text",
+                    "fields": {
+                        "cs": {"type": "text", "analyzer": "cs_analyzer"}
+                    }
+                },
+            }
         }
-    )
+    }
+    client.indices.create(index=INDEX_NAME, body=body)
 
 
 def reset_index() -> None:
-    """Delete the index if it exists, then recreate with current mapping."""
+    """Delete index if present, then recreate with current mapping."""
     try:
         if client.indices.exists(index=INDEX_NAME):
             client.indices.delete(index=INDEX_NAME, ignore=[400, 404])
@@ -100,11 +116,11 @@ def reset_index() -> None:
 # ----------------------------
 def _iter_sql_files(root: Path) -> Iterable[Path]:
     """
-    Walk 'root' recursively, pruning excluded directories, yielding files
-    whose suffix matches INCLUDE_EXTENSIONS.
+    Recursively yield files under 'root' matching INCLUDE_EXTENSIONS.
+    Excludes directories by name (case-insensitive) using EXCLUDE_DIRS.
     """
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
-        # prune excluded dirs (by name, case-insensitive)
+        # prune excluded dirs
         dirnames[:] = [d for d in dirnames if d.lower() not in EXCLUDE_DIRS]
         for fn in filenames:
             p = Path(dirpath) / fn
@@ -115,7 +131,7 @@ def _iter_sql_files(root: Path) -> Iterable[Path]:
 def collect_sql_files(roots: List[Union[str, Path]]) -> Tuple[List[Dict], int]:
     """
     Read ALL matching files (no delta). Returns (docs, scanned_count).
-    Each document _id is the absolute path, so reindexing upserts deterministically.
+    Each document uses absolute path as _id for deterministic upserts.
     """
     docs: List[Dict] = []
     scanned = 0
@@ -130,9 +146,8 @@ def collect_sql_files(roots: List[Union[str, Path]]) -> Tuple[List[Dict], int]:
                 st = file.stat()
             except Exception:
                 continue
+            scanned += 1
             if st.st_size > max_bytes:
-                # skip huge files
-                scanned += 1
                 continue
 
             try:
@@ -143,20 +158,19 @@ def collect_sql_files(roots: List[Union[str, Path]]) -> Tuple[List[Dict], int]:
             abs_path = str(file.resolve())
             docs.append(
                 {
-                    "_id": abs_path,         # stable id -> upsert
+                    "_id": abs_path,
                     "path": abs_path,
                     "filename": file.name,
                     "content": text,
                 }
             )
-            scanned += 1
 
     return docs, scanned
 
 # ----------------------------
 # Bulk indexing
 # ----------------------------
-def _bulk_actions(docs: List[Dict]) -> Iterable[Dict]:
+def _bulk_actions(docs: List[Dict]):
     for d in docs:
         yield {
             "_op_type": "index",
@@ -171,9 +185,7 @@ def _bulk_actions(docs: List[Dict]) -> Iterable[Dict]:
 
 
 def index_documents(docs: List[Dict]) -> Dict:
-    """
-    Index provided docs via helpers.bulk; returns summary.
-    """
+    """Index docs via helpers.bulk; returns summary dict."""
     if not docs:
         return {"indexed": 0, "errors": False, "error_items": []}
 
@@ -183,19 +195,19 @@ def index_documents(docs: List[Dict]) -> Dict:
             _bulk_actions(docs),
             chunk_size=BULK_CHUNK_SIZE,
             request_timeout=REQUEST_TIMEOUT,
-            refresh="wait_for",  # make docs searchable when we return
+            refresh="wait_for",  # searchable when we return
         )
         return {"indexed": int(success), "errors": bool(details), "error_items": []}
     except BulkIndexError as bie:
-        error_items = []
-        for item in bie.errors[:10]:  # cap error echo
+        items = []
+        for item in bie.errors[:10]:
             try:
                 action = next(iter(item))
                 info = item[action]
-                error_items.append(f"{action}: {info.get('error')}")
+                items.append(f"{action}: {info.get('error')}")
             except Exception:
-                error_items.append(str(item))
-        return {"indexed": bie.count, "errors": True, "error_items": error_items}
+                items.append(str(item))
+        return {"indexed": bie.count, "errors": True, "error_items": items}
     except Exception as ex:
         return {"indexed": 0, "errors": True, "error_items": [repr(ex)]}
 
@@ -207,32 +219,44 @@ def reindex(
     on_phase: Optional[callable] = None,
 ) -> Dict:
     """
-    Full reindex (stateless):
-      - ensure index exists,
-      - collect ALL docs from roots (no delta),
+    Full reindex:
+      - ensure index,
+      - resolve roots from args or config,
+      - collect all docs,
       - bulk upsert.
     """
     ensure_index()
 
-    root_paths = [Path(p).expanduser() if not isinstance(p, Path) else p for p in (roots or SQL_SOURCE_PATHS)]
+    # Resolve roots: request parameter > config file
+    root_paths = (
+        [Path(p).expanduser() if not isinstance(p, Path) else p for p in roots]
+        if roots
+        else SQL_SOURCE_PATHS
+    )
+
     if not root_paths:
-        if on_phase: on_phase("done")
+        if on_phase:
+            on_phase("done")
         return {
             "indexed": 0,
             "considered": 0,
             "scanned": 0,
             "errors": False,
             "error_items": [],
-            "note": "No roots provided and config.yml has no sql_source_paths.",
+            "note": "No roots provided and seekql.config.yml has no sql_source_paths.",
         }
 
-    if on_phase: on_phase("collect")
+    if on_phase:
+        on_phase("collect")
     docs, scanned = collect_sql_files(root_paths)
 
-    if on_phase: on_phase("bulk")
+    if on_phase:
+        on_phase("bulk")
     res = index_documents(docs)
 
-    if on_phase: on_phase("done")
+    if on_phase:
+        on_phase("done")
+
     out = dict(res)
     out["considered"] = len(docs)
     out["scanned"] = scanned

@@ -1,0 +1,17 @@
+# Copy this file to seekql.config.yml and adjust paths.
+# You can also set SEEKQL_CONFIG to point to an external file.
+
+sql_source_paths:
+  - "C:/path/to/your/sql"
+  # - "D:/another/folder"
+  # - "./relative/folder"
+
+include_extensions:
+  - .sql
+
+exclude_dirs:
+  - .git
+  - node_modules
+  - __pycache__
+
+max_file_size_mb: 10

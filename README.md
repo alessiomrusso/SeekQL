@@ -20,3 +20,6 @@
 > network.host: 127.0.0.1
 > discovery.type: single-node
 > ```
+
+> cp seekql.config.yml.example seekql.config.yml
+# then edit seekql.config.yml and set your folders
