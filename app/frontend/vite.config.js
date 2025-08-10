@@ -10,7 +10,8 @@ export default defineConfig({
       '/index':  'http://localhost:8000',
       '/status': 'http://localhost:8000',
       '/health': 'http://localhost:8000',
-      '/doc':    'http://localhost:8000'
+      '/doc':    'http://localhost:8000',
+      '/config':    'http://localhost:8000'
     }
   }
 })

@@ -14,8 +14,10 @@ from fastapi.responses import FileResponse
 
 from opensearchpy.exceptions import NotFoundError
 
+from pydantic import BaseModel, Field
+
 from .schemas import IndexRequest
-from .indexer import reindex, client, ensure_index, reset_index, INDEX_NAME
+from .indexer import reindex, client, ensure_index, reset_index, INDEX_NAME, inspect_config, save_config
 
 app = FastAPI(title="SeekQL")
 
@@ -248,3 +250,33 @@ def search(q: str, limit: int = 10, offset: int = 0, highlight: bool = True):
     total = res["hits"]["total"]["value"] if isinstance(res["hits"]["total"], dict) else res["hits"]["total"]
     return {"query": q, "hits": hits, "total": total}
 
+class ConfigUpdate(BaseModel):
+    sql_source_paths: List[str] = Field(default_factory=list)
+
+@app.get("/config")
+def get_config():
+    with _state_lock:
+        indexing = bool(_index_state.get("indexing"))
+
+    info = inspect_config()
+    info["indexing"] = indexing
+    try:
+        info["doc_count"] = client.count(index=INDEX_NAME).get("count", 0)
+    except Exception:
+        info["doc_count"] = 0
+    return info
+
+@app.post("/config")
+def update_config(payload: ConfigUpdate):
+    # block config writes during indexing
+    with _state_lock:
+        if _index_state.get("indexing"):
+            raise HTTPException(status_code=423, detail="Indexing in progress")
+    try:
+        res = save_config(payload.sql_source_paths)
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
+    # return fresh view
+    info = inspect_config()
+    info.update(res)
+    return info

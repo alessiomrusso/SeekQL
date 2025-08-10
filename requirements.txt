@@ -5,6 +5,7 @@ python-dotenv
 opensearch-py>=2.3.1
 pydantic
 PyYAML
+ruamel.yaml
 
 # dev/build
 pyinstaller

@@ -1,10 +1,37 @@
 # app/backend/indexer.py
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-import yaml
+# ----------------------------
+# YAML (preserve comments/format with ruamel if available)
+# ----------------------------
+_YAML_RUAMEL = False
+try:
+    from ruamel.yaml import YAML  # type: ignore
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq  # type: ignore
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString as DQ  # type: ignore
+
+    _YAML_RUAMEL = True
+    _yaml = YAML()
+    # Keep user formatting as much as possible
+    _yaml.preserve_quotes = True
+    _yaml.width = 10_000           # avoid line wrapping
+    _yaml.indent(mapping=2, sequence=2, offset=2)
+    _yaml.default_flow_style = False
+except Exception:
+    # Fallback: PyYAML (will NOT preserve comments/formatting)
+    import yaml as _yaml  # type: ignore
+    CommentedMap = dict          # type: ignore
+    CommentedSeq = list          # type: ignore
+    DQ = str                     # type: ignore
+
+# ----------------------------
+# OpenSearch
+# ----------------------------
 from opensearchpy import OpenSearch, helpers
 from opensearchpy.helpers import BulkIndexError
 
@@ -19,40 +46,88 @@ BULK_CHUNK_SIZE = int(os.getenv("BULK_CHUNK_SIZE", "500"))
 REQUEST_TIMEOUT = int(os.getenv("OS_REQUEST_TIMEOUT", "120"))
 
 # ----------------------------
-# Config loading (root-level seekql.config.yml)
+# Project root / config path resolution
 # ----------------------------
-
 def _project_root() -> Path:
     """
     When frozen (PyInstaller onefile), use the folder where the EXE lives.
-    When running from source, project root is two levels up from this file (…/app/backend -> root).
+    When running from source, project root is two levels up from this file (.../app/backend -> root).
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
 
-# Determine config file path:
+
 CFG_PATH = os.getenv("SEEKQL_CONFIG")
-if CFG_PATH:
-    CONFIG_FILE = Path(CFG_PATH).expanduser()
-else:
-    CONFIG_FILE = _project_root() / "seekql.config.yml"
+CONFIG_FILE = Path(CFG_PATH).expanduser() if CFG_PATH else _project_root() / "seekql.config.yml"
 
-_cfg = {}
-if CONFIG_FILE.exists():
-    with CONFIG_FILE.open("r", encoding="utf-8") as f:
-        _cfg = yaml.safe_load(f) or {}
+# Default commented template used if we need to create a file on save (keeps your comments/layout)
+_SEEKQL_TEMPLATE = """# SeekQL config
 
-# Pull values with sane fallbacks
-SQL_SOURCE_PATHS: List[Path] = [
-    Path(p).expanduser() for p in _cfg.get("sql_source_paths", [])
-]
+# One or more folders; each will be scanned recursively
+sql_source_paths:
+  - "C:/path/to/your/sql"
+
+# Optional: which file extensions to index
+include_extensions:
+  - .sql
+
+# Optional: skip directories by name (case-insensitive)
+exclude_dirs:
+  - node_modules
+  - .git
+  - __pycache__
+
+# Optional: max file size (MB) to index
+max_file_size_mb: 10
+"""
+
+def _load_config_obj() -> CommentedMap:
+    """
+    Load YAML into a ruamel CommentedMap when available (preserves comments/format).
+    Falls back to plain dict with PyYAML.
+    """
+    if CONFIG_FILE.exists():
+        with CONFIG_FILE.open("r", encoding="utf-8") as f:
+            if _YAML_RUAMEL:
+                data = _yaml.load(f)  # CommentedMap
+                return data if isinstance(data, CommentedMap) else CommentedMap(data or {})
+            else:
+                import yaml as pyyaml  # type: ignore
+                return CommentedMap(pyyaml.safe_load(f) or {})
+    return CommentedMap()
+
+def _dump_config_obj(obj: CommentedMap) -> None:
+    """Write YAML back. With ruamel: preserves comments/format; with PyYAML: formatting/comments are lost."""
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with CONFIG_FILE.open("w", encoding="utf-8") as f:
+        if _YAML_RUAMEL:
+            _yaml.dump(obj, f)
+        else:
+            # PyYAML fallback (no comments preserved)
+            try:
+                import yaml as pyyaml  # type: ignore
+                pyyaml.safe_dump(obj, f, sort_keys=False, allow_unicode=True)
+            except Exception:
+                # Last-resort dump
+                f.write(str(obj))
+
+_cfg: CommentedMap = _load_config_obj()
+
+def _get_list(obj, key, default):
+    v = obj.get(key, default)
+    return list(v) if isinstance(v, (list, tuple)) else default
+
+SQL_SOURCE_PATHS: List[Path] = [Path(p).expanduser() for p in _get_list(_cfg, "sql_source_paths", [])]
 INCLUDE_EXTENSIONS: Tuple[str, ...] = tuple(
     (ext if str(ext).startswith(".") else f".{ext}").lower()
-    for ext in _cfg.get("include_extensions", [".sql"])
+    for ext in _get_list(_cfg, "include_extensions", [".sql"])
 )
-EXCLUDE_DIRS = set(d.lower() for d in _cfg.get("exclude_dirs", []))
-MAX_FILE_SIZE_MB = int(_cfg.get("max_file_size_mb", os.getenv("MAX_FILE_SIZE_MB", 10)))
+EXCLUDE_DIRS = set(str(d).lower() for d in _get_list(_cfg, "exclude_dirs", []))
+try:
+    MAX_FILE_SIZE_MB = int(_cfg.get("max_file_size_mb", os.getenv("MAX_FILE_SIZE_MB", 10)))
+except Exception:
+    MAX_FILE_SIZE_MB = 10
 
 # ----------------------------
 # OpenSearch client
@@ -82,7 +157,7 @@ def ensure_index() -> None:
                     "cs_analyzer": {
                         "type": "custom",
                         "tokenizer": "standard",
-                        "filter": []  # no lowercase -> case-sensitive
+                        "filter": []  # no lowercase -> case-sensitive tokens
                     }
                 }
             }
@@ -102,7 +177,6 @@ def ensure_index() -> None:
     }
     client.indices.create(index=INDEX_NAME, body=body)
 
-
 def reset_index() -> None:
     """Delete index if present, then recreate with current mapping."""
     try:
@@ -110,6 +184,86 @@ def reset_index() -> None:
             client.indices.delete(index=INDEX_NAME, ignore=[400, 404])
     finally:
         ensure_index()
+
+# ----------------------------
+# Config inspection / persistence
+# ----------------------------
+def inspect_config() -> Dict:
+    items = []
+    for p in (SQL_SOURCE_PATHS or []):
+        rp = Path(p).expanduser()
+        try:
+            resolved = str(rp.resolve())
+        except Exception:
+            resolved = str(rp)
+        items.append({
+            "input": str(p),
+            "resolved": resolved,
+            "exists": rp.exists(),
+            "is_dir": rp.is_dir() if rp.exists() else False,
+        })
+    return {
+        "config_file": str(CONFIG_FILE),
+        "config_present": CONFIG_FILE.exists(),
+        "sql_source_paths": items,
+        "include_extensions": list(INCLUDE_EXTENSIONS),
+        "exclude_dirs": list(EXCLUDE_DIRS),
+        "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "preserve_comments": _YAML_RUAMEL,
+    }
+
+def save_config(new_paths: List[str]) -> dict:
+    """
+    Update ONLY the sequence under 'sql_source_paths' IN-PLACE,
+    preserving comments/spacing/ordering around it (when ruamel is available).
+    Also keeps Windows paths quoted for readability.
+    """
+    global _cfg, SQL_SOURCE_PATHS
+
+    cleaned_raw = [str(p).strip() for p in new_paths if str(p).strip()]
+
+    # Keep quotes on Windows-like absolute paths (C:\...) for readability
+    cleaned: List[str] = []
+    for p in cleaned_raw:
+        cleaned.append(p)
+
+    # Ensure file exists with initial template (to preserve original formatting/comments)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(_SEEKQL_TEMPLATE, encoding="utf-8")
+
+    cfg_obj: CommentedMap = _load_config_obj()
+
+    if _YAML_RUAMEL:
+        # IN-PLACE edit using CommentedSeq; preserve any end comment that sits between this key and the next
+        seq = cfg_obj.get("sql_source_paths")
+        if not isinstance(seq, CommentedSeq):
+            seq = CommentedSeq(list())
+            # If key existed as plain list earlier, reattach in same position
+            cfg_obj["sql_source_paths"] = seq
+
+        # Preserve the "end" comment (often the comment separating this key from the next)
+        end_comment = getattr(seq.ca, "end", None)
+
+        # Replace items in one go (slice assignment keeps node & comments)
+        # Use DQ to keep quotes around paths
+        seq[:] = [DQ(s) for s in cleaned]
+
+        # Restore end comment if it existed
+        if end_comment is not None:
+            seq.ca.end = end_comment
+    else:
+        # Fallback: replace value (comments/formatting will be lost)
+        cfg_obj["sql_source_paths"] = cleaned
+
+    _dump_config_obj(cfg_obj)
+
+    # Refresh in-memory snapshot from *current* object
+    _cfg = cfg_obj
+    # Convert possibly quoted scalars back to plain strings
+    SQL_SOURCE_PATHS = [Path(str(p)).expanduser() for p in _get_list(_cfg, "sql_source_paths", [])]
+
+    return {"ok": True, "count": len(SQL_SOURCE_PATHS)}
 
 # ----------------------------
 # File collection (stateless)
@@ -126,7 +280,6 @@ def _iter_sql_files(root: Path) -> Iterable[Path]:
             p = Path(dirpath) / fn
             if p.suffix.lower() in INCLUDE_EXTENSIONS:
                 yield p
-
 
 def collect_sql_files(roots: List[Union[str, Path]]) -> Tuple[List[Dict], int]:
     """
@@ -183,21 +336,20 @@ def _bulk_actions(docs: List[Dict]):
             },
         }
 
-
 def index_documents(docs: List[Dict]) -> Dict:
     """Index docs via helpers.bulk; returns summary dict."""
     if not docs:
         return {"indexed": 0, "errors": False, "error_items": []}
 
     try:
-        success, details = helpers.bulk(
+        success, _details = helpers.bulk(
             client,
             _bulk_actions(docs),
             chunk_size=BULK_CHUNK_SIZE,
             request_timeout=REQUEST_TIMEOUT,
             refresh="wait_for",  # searchable when we return
         )
-        return {"indexed": int(success), "errors": bool(details), "error_items": []}
+        return {"indexed": int(success), "errors": False, "error_items": []}
     except BulkIndexError as bie:
         items = []
         for item in bie.errors[:10]:
@@ -214,6 +366,10 @@ def index_documents(docs: List[Dict]) -> Dict:
 # ----------------------------
 # Public API
 # ----------------------------
+def ensure_index_ready() -> None:
+    """Alias kept for compatibility."""
+    ensure_index()
+
 def reindex(
     roots: Optional[List[Union[str, Path]]] = None,
     on_phase: Optional[callable] = None,
