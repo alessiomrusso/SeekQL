@@ -1,0 +1,14 @@
+# One or more roots to scan for .sql (recursive)
+sql_source_paths:
+  - "../../sql_files"   # default project-local folder (create if you want)
+  # - "C:/path/to/another/sql_repo"
+  # - "D:/shared/sql_scripts"
+
+# Extensions to include
+include_extensions:
+  - ".sql"
+
+# Directory names to exclude (case insensitive match on dir name)
+exclude_dirs:
+  - "archive"
+  - "tmp"

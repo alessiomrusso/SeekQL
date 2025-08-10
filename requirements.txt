@@ -1,0 +1,10 @@
+# runtime
+fastapi
+uvicorn[standard]
+python-dotenv
+opensearch-py>=2.3.1
+pydantic
+PyYAML
+
+# dev/build
+pyinstaller

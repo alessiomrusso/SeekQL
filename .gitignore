@@ -1,0 +1,91 @@
+# -----------------------
+# Python
+# -----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+
+# Python cache & logs
+*.log
+*.pot
+*.mo
+
+# -----------------------
+# Node / Vite (frontend)
+# -----------------------
+node_modules/
+dist/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Vite cache
+.vite/
+vite-start.log
+
+# -----------------------
+# OS / Editor
+# -----------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+desktop.ini
+
+# VSCode / IDEs
+.vscode/
+.idea/
+*.iml
+
+# -----------------------
+# OpenSearch
+# -----------------------
+lib/opensearch/
+
+# -----------------------
+# App runtime & config
+# -----------------------
+.seekql_state.json
+.index_meta.json
+seekql.config.yml
+
+# -----------------------
+# PyInstaller / Executable
+# -----------------------
+*.exe
+*.dll
+*.manifest
+*.spec
+build/
+dist/
+tmp/
+temp/
+
+# PyInstaller temp extraction dirs
+*_MEI*/
+
+# -----------------------
+# Environment & secrets
+# -----------------------
+.env
+.env.local
+.env.development
+.env.production
+.env.test
